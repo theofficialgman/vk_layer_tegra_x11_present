@@ -175,9 +175,7 @@
     M(XGetWindowAttributes, Status, (Display *, Window, XWindowAttributes *)) \
     M(XResizeWindow,     int,     (Display *, Window, unsigned, unsigned)) \
     M(XFlush,            int,     (Display *)) \
-    M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int)) \
-    M(XGetSelectionOwner, Window, (Display *, Atom)) \
-    M(XGetWindowProperty, int,    (Display *, Window, Atom, long, long, Bool, Atom, Atom *, int *, unsigned long *, unsigned long *, unsigned char **))
+    M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int))
 
 #define GL_FUNCS(M) \
     M(glGetError,                GLenum,  (void)) \
@@ -332,8 +330,6 @@ static bool lib_load(void) {
 #define XResizeWindow             (g_libs.XResizeWindow)
 #define XFlush                    (g_libs.XFlush)
 #define XChangeProperty           (g_libs.XChangeProperty)
-#define XGetSelectionOwner        (g_libs.XGetSelectionOwner)
-#define XGetWindowProperty        (g_libs.XGetWindowProperty)
 
 #define glGetError                (g_libs.glGetError)
 #define glClear                   (g_libs.glClear)
@@ -796,10 +792,6 @@ typedef struct Swapchain {
     VkFormat      format;
     VkColorSpaceKHR color_space;
     VkPresentModeKHR present_mode;
-    /* True if an X compositor was running when this swapchain was created.
-       Affects the swap-interval strategy and SGI vblank wait ordering in
-       the worker thread — see the big comment in the worker setup block. */
-    bool has_compositor;
     /* Usage flags the app requested for swapchain images. We honor these
        (OR'd with what we need ourselves) when creating our images. PPSSPP
        in particular asks for INPUT_ATTACHMENT_BIT for its subpass effects;
@@ -1088,42 +1080,26 @@ static void *worker_thread_main(void *arg) {
         return NULL;
     }
 
-    /* Swap interval strategy.
-       The right interval depends on whether a compositor is running:
-
-       WITH compositor (KWin etc.):
-         glXSwapBuffers(interval=1) blocks for ~1 full vblank while the
-         compositor takes ownership of the buffer.  If we then call
-         glXWaitVideoSyncSGI we consume a second vblank — 30Hz total.
-         Fix: use interval 0 so glXSwapBuffers returns immediately; the
-         SGI wait BEFORE the swap (see the worker loop) provides the
-         single vblank gate.  The compositor's own vsync pipeline
-         guarantees tear-free presentation regardless of our interval.
-
-       WITHOUT compositor (Lakka, direct-to-display):
-         glXSwapBuffers(interval=1) is an async DRM flip that returns
-         immediately without consuming a vblank on our thread; the SGI
-         wait AFTER the swap is the only vblank gate, giving 60Hz.
-         We must keep interval=1 here — interval=0 without a compositor
-         means no vsync gating at the driver level and causes tearing.
-
-       IMMEDIATE: always interval 0 (app wants no pacing whatsoever).
-       MAILBOX: same interval as FIFO. MAILBOX is "non-blocking producer
-       + vsync-paced consumer", not "no vsync at all" — only the
-       producer-side blocking is removed (handled in worker_post via the
-       displaced_idx mechanism).
-       FIFO_RELAXED: -1 (late-tearing) without compositor, 0 with. */
+    /* Swap interval: mirrors what any standard GL application uses.
+       glXSwapBuffers(interval=1) is the correct vsync mechanism in both
+       compositor and non-compositor environments:
+         - Without compositor: the driver schedules an async DRM page flip
+           and returns immediately; the display controller presents it at
+           the next vblank.
+         - With compositor: the compositor pipeline blocks glXSwapBuffers
+           for ~1 vblank while it takes the buffer; its own rendering loop
+           then presents at the next vblank.
+       In both cases one call to glXSwapBuffers(interval=1) = one frame at
+       the display's native refresh rate.  glXWaitVideoSyncSGI is a
+       CPU-efficiency add-on layered on top — see the worker loop. */
     if (sc->glXSwapIntervalEXT) {
         int interval;
-        if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+        if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR)
             interval = 0;
-        } else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
-            interval = sc->has_compositor ? 0 : -1;
-        } else {
-            /* FIFO and MAILBOX: 0 with compositor (SGI before swap gates
-               vblank), 1 without (driver-side vsync, no double-wait). */
-            interval = sc->has_compositor ? 0 : 1;
-        }
+        else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+            interval = -1;
+        else
+            interval = 1;   /* FIFO, MAILBOX */
         sc->glXSwapIntervalEXT(sc->worker_dpy, sc->child_window, interval);
     }
 
@@ -1135,6 +1111,15 @@ static void *worker_thread_main(void *arg) {
        wait. Local because the worker thread runs the same loop for the
        swapchain's lifetime. */
     uint64_t prev_vblank_ns = 0;
+    /* EWMA of glXSwapBuffers duration, used to distinguish fast (async DRM
+       flip, direct scanout) from slow (compositor blocking, ~1 vblank).
+       Seeded with the first observed swap on the first iteration. */
+    uint64_t avg_swap_ns = 0;
+    bool avg_swap_valid = false;
+    /* -1 = not yet known; 0 = SGI skipped (slow swap); 1 = SGI active (fast swap). */
+    int prev_sgi_state = -1;
+    /* Timestamp of the last periodic avg-swap log line (0 = not yet printed). */
+    uint64_t last_swap_log_ns = 0;
 
     for (;;) {
         /* Wait for work or shutdown. */
@@ -1190,70 +1175,98 @@ static void *worker_thread_main(void *arg) {
            quad. */
         glFinish();
 
-        /* Present and vblank synchronisation.
-           The right ordering of glXSwapBuffers and glXWaitVideoSyncSGI
-           depends on whether a compositor is running (see the swap-interval
-           comment in the worker setup block above for the full rationale).
+        /* Swap and adaptive SGI sleep.
 
-           WITH compositor: SGI wait → capture time → swap (interval 0).
-             The compositor's pipeline causes glXSwapBuffers(interval=1) to
-             block for ~1 vblank, so calling SGI afterwards would double-wait
-             and halve throughput to 30Hz.  With interval 0 the swap returns
-             immediately; the SGI wait before it is the single vblank gate.
+           glXSwapBuffers(interval=1) provides correct vsync regardless of
+           whether a compositor is running:
+             - Without compositor: async DRM flip; returns immediately; the
+               display controller presents at the next vblank.
+             - With compositor: compositor pipeline blocks the call for ~1
+               vblank while taking the buffer; the compositor presents at
+               the next vblank.
+           Either way, one swap = one frame at the display refresh rate.
 
-           WITHOUT compositor: swap (interval 1) → SGI wait → capture time.
-             glXSwapBuffers returns quickly here (async DRM flip), so the SGI
-             wait after is the only vblank gate — no double-wait, 60Hz. */
+           glXWaitVideoSyncSGI is a CPU-efficiency add-on: on NVIDIA Tegra
+           the thread would otherwise spin (sched_yield) until the next
+           work arrives from the app.  SGI puts it to sleep in the kernel
+           for most of the inter-frame interval.
 
-        /* Whether to do the SGI vblank wait at all.
+           The catch: SGI must only be called when the swap itself returned
+           quickly.  If the compositor blocked the swap for ~1 vblank (i.e.
+           swap_ns ≥ refresh_duration_ns/2), calling SGI afterwards would
+           add a second vblank wait and cap the frame rate at 30Hz.  When
+           the swap was already slow, the vblank is already consumed — skip
+           SGI and return immediately to accept the next frame.
 
-           IMMEDIATE: no, the app asked for no pacing.
+           This logic is entirely self-contained: it requires no knowledge
+           of whether a compositor is running, and adapts correctly on the
+           very next frame whenever the compositing state changes. */
 
-           MAILBOX: yes. The mailbox semantic is about the *producer*
-           not blocking when a previous present is still pending; the
-           consumer (us) still paces presentation at the display
-           refresh rate, displaying the most-recent posted image at
-           each refresh. Producer-side non-blocking is handled in
-           worker_post via the displaced_idx mechanism.
-
-           FIFO / FIFO_RELAXED: yes. */
-        bool do_sgi = sc->glXWaitVideoSyncSGI
-                      && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR;
-
-        uint64_t actual_ns = 0;
-
-        if (do_sgi && sc->has_compositor) {
-            /* Compositor path: gate on vblank, capture time, then swap. */
-            unsigned int count = 0;
-            if (sc->glXGetVideoSyncSGI(&count) == 0)
-                sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
-            else
-                sc->glXWaitVideoSyncSGI(2, 0, &count);
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            actual_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-        }
-
+        struct timespec _t0, _t1;
+        clock_gettime(CLOCK_MONOTONIC, &_t0);
         glXSwapBuffers(sc->worker_dpy, sc->child_window);
-        /* Push the swap request out of Xlib's output buffer immediately so
-           it reaches the X server before the vblank window closes. */
+        clock_gettime(CLOCK_MONOTONIC, &_t1);
+        uint64_t swap_ns = ((uint64_t)_t1.tv_sec  * 1000000000ULL + _t1.tv_nsec)
+                         - ((uint64_t)_t0.tv_sec  * 1000000000ULL + _t0.tv_nsec);
         XFlush(sc->worker_dpy);
 
-        if (do_sgi && !sc->has_compositor) {
-            /* Direct path: gate on vblank after the swap, then capture time. */
+        /* Update the EWMA of swap duration.  Seed with the first observed
+           value to avoid a misleading zero on the first frame. */
+        if (!avg_swap_valid) {
+            avg_swap_ns   = swap_ns;
+            avg_swap_valid = true;
+        } else {
+            /* 7/8 old + 1/8 new — window ≈ 8 frames (~130 ms at 60 Hz).
+               Long enough to ride out 1-3 transient spikes (scheduler
+               jitter, GPU hiccup, compositor bypass race on startup) but
+               short enough to follow a real mode change within ~8 frames. */
+            avg_swap_ns = (7 * avg_swap_ns + swap_ns) / 8;
+        }
+
+        /* SGI: only call when the average swap duration is consistently
+           fast (vblank not yet consumed by the swap itself). */
+        bool do_sgi = sc->glXWaitVideoSyncSGI
+                      && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR
+                      && avg_swap_ns < sc->refresh_duration_ns / 2;
+
+        if ((int)do_sgi != prev_sgi_state) {
+            if (do_sgi)
+                LOG_INFO("vsync path -> SGI kernel sleep "
+                         "(avg swap %.2f ms, fast — direct scanout or bypass active)",
+                         (double)avg_swap_ns / 1e6);
+            else
+                LOG_INFO("vsync path -> swap blocking "
+                         "(avg swap %.2f ms >= %.2f ms threshold — compositor compositing window, SGI skipped)",
+                         (double)avg_swap_ns / 1e6,
+                         (double)(sc->refresh_duration_ns / 2) / 1e6);
+            prev_sgi_state = (int)do_sgi;
+        }
+
+        if (do_sgi) {
             unsigned int count = 0;
             if (sc->glXGetVideoSyncSGI(&count) == 0)
                 sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
             else
                 sc->glXWaitVideoSyncSGI(2, 0, &count);
+        }
+
+        /* Capture the vblank timestamp: after SGI if it ran (the SGI wait
+           lands at the hardware vblank), or right after the slow swap if it
+           didn't (the swap itself blocked until the compositor's vblank). */
+        uint64_t actual_ns;
+        {
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
             actual_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
         }
 
-        /* Fallback timing for modes with no SGI wait (IMMEDIATE, MAILBOX,
-           or SGI extension absent): capture after the swap. */
-        if (actual_ns == 0) {
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            actual_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        /* Periodic debug log: avg swap duration once per second.
+           Enable with VK_TEGRA_X11_PRESENT_LOG=2. */
+        if (last_swap_log_ns == 0 || actual_ns - last_swap_log_ns >= 1000000000ULL) {
+            LOG_INFO("avg swap %.2f ms  threshold %.2f ms  path: %s",
+                    (double)avg_swap_ns / 1e6,
+                    (double)(sc->refresh_duration_ns / 2) / 1e6,
+                    do_sgi ? "SGI sleep" : "swap blocking");
+            last_swap_log_ns = actual_ns;
         }
 
         /* Refine the reported refresh duration from observed
@@ -2008,62 +2021,6 @@ layer_CreateSwapchainKHR(VkDevice device,
     }
 
     int screen = DefaultScreen(surf->dpy);
-
-    /* Detect whether an X compositor is actively compositing this window.
-       Two conditions must both hold:
-
-       1. A compositor is running: the ICCCM convention is that any
-          compositor that owns a screen claims the selection
-          "_NET_WM_CM_S<screen>".  If that atom exists and has an owner,
-          a compositor is present.
-
-       2. The window is not bypassing the compositor: if the app (or we
-          ourselves) set _NET_WM_BYPASS_COMPOSITOR=1 on the surface
-          window, KWin and other compositors stop managing that window and
-          give it direct scanout — identical presentation behaviour to
-          running without a compositor at all.  In that case we must use
-          the no-compositor vsync path (interval=1, SGI after swap) even
-          though the compositor selection is still owned.
-
-       This affects the worker's vsync strategy — see the swap-interval
-       comment in the worker setup block for the full rationale. */
-    {
-        char sel_name[32];
-        snprintf(sel_name, sizeof(sel_name), "_NET_WM_CM_S%d", screen);
-        Atom sel = XInternAtom(surf->dpy, sel_name, True /* only_if_exists */);
-        sc->has_compositor = (sel != None && XGetSelectionOwner(surf->dpy, sel) != None);
-
-        if (sc->has_compositor) {
-            /* Check whether the app has asked the compositor to bypass
-               this window (direct scanout).  If so, the compositor is
-               not compositing us and we must treat it as absent. */
-            Atom bypass_atom = XInternAtom(surf->dpy, "_NET_WM_BYPASS_COMPOSITOR",
-                                           True /* only_if_exists */);
-            if (bypass_atom != None) {
-                Atom actual_type = None; int actual_fmt = 0;
-                unsigned long nitems = 0, bytes_after = 0;
-                unsigned char *data = NULL;
-                int rc = XGetWindowProperty(surf->dpy, surf->window,
-                                            bypass_atom, 0, 1, False,
-                                            XA_CARDINAL, &actual_type, &actual_fmt,
-                                            &nitems, &bytes_after, &data);
-                /* Only dereference when the property actually exists and
-                   holds at least one 32-bit CARDINAL value.  Xlib returns
-                   Success with nitems=0 (and a non-NULL prop_return that
-                   still must be freed) when the property is absent — reading
-                   past that zero-byte buffer is undefined behaviour. */
-                if (rc == Success && data && nitems >= 1
-                    && actual_type == XA_CARDINAL && actual_fmt == 32) {
-                    long val = *(long *)data;
-                    if (val == 1)
-                        sc->has_compositor = false;
-                }
-                if (data) XFree(data);
-            }
-        }
-
-        LOG_INFO("compositor: %s", sc->has_compositor ? "active" : "none/bypassed");
-    }
 
     /* Query the app's window depth so we can prefer a matching FBConfig.
        If the app's window is 32-bit RGBA (Chromium, GTK CSD apps, etc.),
