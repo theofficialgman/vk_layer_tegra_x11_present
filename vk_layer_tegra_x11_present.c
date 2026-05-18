@@ -1227,7 +1227,7 @@ static void *worker_thread_main(void *arg) {
            fast (vblank not yet consumed by the swap itself). */
         bool do_sgi = sc->glXWaitVideoSyncSGI
                       && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR
-                      && avg_swap_ns < sc->refresh_duration_ns / 2;
+                      && avg_swap_ns < sc->refresh_duration_ns / 4;
 
         if ((int)do_sgi != prev_sgi_state) {
             if (do_sgi)
@@ -1238,7 +1238,7 @@ static void *worker_thread_main(void *arg) {
                 LOG_INFO("vsync path -> swap blocking "
                          "(avg swap %.2f ms >= %.2f ms threshold — compositor compositing window, SGI skipped)",
                          (double)avg_swap_ns / 1e6,
-                         (double)(sc->refresh_duration_ns / 2) / 1e6);
+                         (double)(sc->refresh_duration_ns / 4) / 1e6);
             prev_sgi_state = (int)do_sgi;
         }
 
@@ -1264,7 +1264,7 @@ static void *worker_thread_main(void *arg) {
         if (last_swap_log_ns == 0 || actual_ns - last_swap_log_ns >= 1000000000ULL) {
             LOG_INFO("avg swap %.2f ms  threshold %.2f ms  path: %s",
                     (double)avg_swap_ns / 1e6,
-                    (double)(sc->refresh_duration_ns / 2) / 1e6,
+                    (double)(sc->refresh_duration_ns / 4) / 1e6,
                     do_sgi ? "SGI sleep" : "swap blocking");
             last_swap_log_ns = actual_ns;
         }
