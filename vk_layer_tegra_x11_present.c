@@ -449,10 +449,10 @@ static void layer_logv(int lvl, const char *prefix, const char *fmt, va_list ap)
     if (g_log_fp) { fputs(buf, g_log_fp); fputc('\n', g_log_fp); }
 }
 
-#define LOG_ERR(fmt, ...)   do { va_list ap_; (void)ap_; layer_log(1, "ERR",  fmt, ##__VA_ARGS__); } while (0)
-#define LOG_WARN(fmt, ...)  do { va_list ap_; (void)ap_; layer_log(1, "WARN", fmt, ##__VA_ARGS__); } while (0)
-#define LOG_INFO(fmt, ...)  do { va_list ap_; (void)ap_; layer_log(2, "info", fmt, ##__VA_ARGS__); } while (0)
-#define LOG_DBG(fmt, ...)   do { va_list ap_; (void)ap_; layer_log(3, "dbg ", fmt, ##__VA_ARGS__); } while (0)
+#define LOG_ERR(fmt, ...)   do { if (g_log_level >= 1) layer_log(1, "ERR",  fmt, ##__VA_ARGS__); } while (0)
+#define LOG_WARN(fmt, ...)  do { if (g_log_level >= 1) layer_log(1, "WARN", fmt, ##__VA_ARGS__); } while (0)
+#define LOG_INFO(fmt, ...)  do { if (g_log_level >= 2) layer_log(2, "info", fmt, ##__VA_ARGS__); } while (0)
+#define LOG_DBG(fmt, ...)   do { if (g_log_level >= 3) layer_log(3, "dbg ", fmt, ##__VA_ARGS__); } while (0)
 
 static void layer_log(int lvl, const char *prefix, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); layer_logv(lvl, prefix, fmt, ap); va_end(ap);
