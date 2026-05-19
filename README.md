@@ -30,10 +30,13 @@ implementation that:
 3. At `vkQueuePresentKHR` time: bridges the application's render-done
    semaphore into a GL semaphore and hands the image to a per-swapchain
    worker thread.
-4. The worker samples the image into the GLX backbuffer, calls
-   `glXSwapBuffers`, then explicitly blocks on the hardware vblank via
-   `glXWaitVideoSyncSGI`. This is the same vsync mechanism KWin uses for
-   NVIDIA on X11.
+4. The worker samples the image into the GLX backbuffer and calls
+   `glXSwapBuffers(interval=1)`, which provides vsync-locked presentation
+   in all environments. If the swap returned quickly (direct scanout —
+   no compositor, or compositor bypassed), the worker also calls
+   `glXWaitVideoSyncSGI` to sleep the thread in the kernel until the next
+   vblank rather than spinning. If the swap was slow (a compositor blocked
+   it for a full vblank), SGI is skipped — the vblank was already consumed.
 5. Bridges GL's sample-done back into a Vulkan semaphore so that the
    next `vkAcquireNextImageKHR` correctly gates the application's re-use
    of the image.
@@ -43,7 +46,7 @@ interop primitives that the stock driver provides.
 
 ## Status
 
-Working on Lakka L4T r32.x Switch builds.
+Working on Lakka and Switchroot Ubuntu Noble L4T r32.x Switch builds.
 
 Tested:
 
@@ -74,8 +77,9 @@ vkQueuePresentKHR                                                       │
                                                        glWaitSemaphoreEXT(vk_render_done)
                                                        draw textured quad
                                                        glSignalSemaphoreEXT(gl_sample[i])  ─┘
-                                                       glXSwapBuffers (interval 1 — driver vsync)
-                                                       glXWaitVideoSyncSGI  ← sleep until next vblank
+                                                       glXSwapBuffers(interval=1)  ← vsync gate
+                                                       [if swap was fast]:
+                                                         glXWaitVideoSyncSGI  ← kernel sleep
                                                        mark mailbox free
 ```
 
@@ -90,38 +94,47 @@ to real presentation rate through this fence.
 
 ## Vsync and CPU usage
 
-Two separate concerns here, handled separately:
+**Vsync.** The worker uses `glXSwapBuffers(interval=1)` for all FIFO
+present modes. This is exactly what any standard GL application does,
+and it provides correct vsync-locked presentation in every environment:
 
-**Tearing prevention.** The worker sets GLX swap interval 1 in the FIFO
-present modes, so `glXSwapBuffers` itself queues each swap to occur at
-the next hardware vblank on whatever display the GLX drawable is
-currently driving. This is what guarantees tear-free presentation. It
-works on the internal Switch panel and on external monitors via the
-dock's DisplayPort path regardless of the display's refresh rate.
+- *Without a compositor* (Lakka, direct-to-display): the driver schedules
+  an async DRM page flip and returns immediately. The display controller
+  presents the buffer at the next vblank.
+- *With a compositor* (KWin, Mutter, picom etc.): the compositor pipeline
+  blocks `glXSwapBuffers` for approximately one vblank while it takes
+  ownership of the buffer, then presents it through its own rendering
+  loop. Vsync is implicit in the compositor's cadence.
 
-**CPU usage.** Setting swap interval 1 alone would also work for vsync
-on NVIDIA Tegra, except that NVIDIA's `glXSwapBuffers` implementation
-of the vsync wait is a `sched_yield()` busy loop, not a kernel sleep.
-The worker thread would show ~100% CPU even when doing nothing —
-draining battery and triggering DVFS upclocks.
+In both cases one `glXSwapBuffers(interval=1)` call = one frame at the
+display's native refresh rate, with no tearing.
 
-To get the thread to actually sleep, after each swap the worker calls
-`glXWaitVideoSyncSGI`, which performs a real kernel-side wait on the
-vblank counter. The thread sleeps in the kernel for most of the
-inter-frame interval. By the time the worker comes back around and
-calls `glXSwapBuffers` again, the previous swap has already completed
-and the next one is queued; the residual spin window inside
-`glXSwapBuffers` is brief.
+**CPU usage.** On NVIDIA Tegra, when there is no compositor the driver's
+`glXSwapBuffers` returns immediately (async flip) rather than waiting
+for the vblank. The worker thread would then spin at the top of its loop
+until the app delivers the next frame, burning CPU.
 
-This pattern is the same one KWin uses for NVIDIA on X11
-([reference](https://github.com/KDE/kwin/blob/master/src/plugins/platforms/x11/standalone/glxbackend.cpp)
-— search for `SGIVideoSyncVsyncMonitor`).
+To keep the thread sleeping in the kernel between frames, the layer
+conditionally calls `glXWaitVideoSyncSGI` after each swap. The decision
+is made by measuring how long `glXSwapBuffers` itself took (EWMA over
+~8 frames):
 
-If `GLX_SGI_video_sync` is not available at runtime (it should always
-be on NVIDIA proprietary drivers), the layer keeps the swap-interval-1
-behavior — vsync still works, but the worker may show high CPU during
-the `glXSwapBuffers` wait. A line in the log on swapchain creation
-tells you which path is active.
+- **Swap was fast** (< 1/4 vblank period): direct scanout — the vblank
+  hasn't been consumed yet. Call `glXWaitVideoSyncSGI` to sleep the
+  thread until the next vblank.
+- **Swap was slow** (≥ 1/4 vblank period): a compositor blocked the swap
+  for a full vblank. The vblank is already consumed; calling SGI would
+  add a *second* vblank wait and cap throughput at 1/2 the native display framerate. Skip SGI.
+
+This requires no knowledge of whether a compositor is running, no X
+property queries, and no static configuration. It adapts automatically
+within ~8 frames whenever the compositing state changes (compositor
+starts, stops, or a window gains/loses compositor bypass).
+
+If `GLX_SGI_video_sync` is unavailable at runtime (uncommon on NVIDIA
+proprietary), the layer falls back to swap-interval-1 alone — vsync is
+still correct, but the worker may show elevated CPU when running without
+a compositor. The log records which path is active whenever it changes.
 
 ## Swap pipeline ordering
 
@@ -201,14 +214,31 @@ that submit from a single thread pay nothing.
 
 ## Compositor coexistence
 
-If a compositor is running and is the only thing rendering to the
-screen, we still produce vsync-locked output to our window; the
-compositor then syncs that to its own present cadence. Some compositors
-(KWin, Mutter) may detect that we're drawing as fast as we can and
-throttle accordingly.
+The layer works correctly whether a compositor is running or not, and
+adapts automatically between the two cases.
 
-For Lakka (no compositor running), we're directly painting to the X
-window on the root and vsync timing is end-to-end accurate.
+**With a compositor (KWin, Mutter, picom etc.):** `glXSwapBuffers`
+blocks for approximately one vblank while the compositor takes the
+buffer. The layer detects this from the measured swap duration (EWMA
+over ~8 frames) and skips the `glXWaitVideoSyncSGI` call that would
+otherwise add a second vblank wait and halve throughput. The compositor
+presents the frame through its own vsync-locked pipeline.
+
+Alpha channel, CSD shadows, translucent borders, and compositor blur
+effects all work: the layer picks a 32-bit ARGB GLX visual for the
+child window so the compositor can blend it against the desktop.
+
+**Without a compositor (Lakka, direct-to-display):** `glXSwapBuffers`
+returns immediately after scheduling an async DRM flip. The layer
+detects the fast return and calls `glXWaitVideoSyncSGI` to sleep the
+worker thread in the kernel until the next vblank, keeping CPU usage
+low. Vsync timing is end-to-end accurate with no intermediate pipeline.
+
+**Transitions:** if a compositor starts, stops, or a window gains or
+loses compositor bypass (`_NET_WM_BYPASS_COMPOSITOR`) after the
+swapchain is created, the layer detects the change within ~8 frames
+and switches paths automatically. A log line at info level records each
+transition and the average swap duration that triggered it.
 
 ## Layout transition handling
 
@@ -271,7 +301,7 @@ The Lakka build recipe does this automatically.
 
 ## Known issues
 
-None confirmed against v3.1 at time of release.
+None confirmed against v5 at time of release.
 
 The earlier PPSSPP libretro core launch crash was resolved in v2 by
 adding the per-device queue submission mutex for spec-compliant
@@ -294,7 +324,34 @@ If both runs reproduce the issue, it isn't the layer — report upstream
 to the app or the ICD vendor. If only the with-layer run fails, it's
 a real layer bug.
 
-## Done in v3.1
+## Done in v5
+
+- **Compositor-aware vsync strategy.** Previously the layer always
+  used `glXSwapBuffers(interval=1)` followed by `glXWaitVideoSyncSGI`.
+  Under a running X compositor (KWin, Mutter, picom etc.) the
+  interval-1 swap blocks for a full vblank while the compositor takes
+  ownership of the buffer, and the SGI wait then consumes a second
+  vblank — net throughput 30 Hz instead of 60 Hz.
+
+  v5 fixes this with an adaptive approach that requires no static
+  compositor detection. `glXSwapBuffers(interval=1)` is always correct
+  — it provides vsync in both compositor and non-compositor
+  environments, just as any standard GL application uses it. The SGI
+  call is a CPU-efficiency add-on that is only valid when the swap
+  returned quickly (no compositor consumed the vblank). The layer
+  measures `glXSwapBuffers` duration per-frame (EWMA over ~8 frames)
+  and skips the SGI call whenever the average duration indicates the
+  compositor is blocking the swap. This handles every compositor
+  configuration — including `_NET_WM_BYPASS_COMPOSITOR` being set or
+  cleared, the compositor starting or stopping mid-session, and KDE's
+  "Allow applications to block compositing" setting — without any X
+  property queries or prior configuration.
+
+  The previous `set_bypass_compositor` call has been removed: the
+  layer now cooperates with the compositor so window shadows, blur, and
+  CSD decorations work correctly on desktop deployments.
+
+## Done in v4
 
 - **`VK_PRESENT_MODE_MAILBOX_KHR` now has the right semantics.** The
   worker's mailbox accepts new presents non-blockingly: when a present
@@ -313,31 +370,7 @@ a real layer bug.
   mode. MAILBOX changes only the *producer-side blocking* behaviour;
   the consumer still presents one image per display refresh.
 
-- **Compositor-aware vsync strategy.** Previously the layer always
-  used `glXSwapBuffers(interval=1)` followed by `glXWaitVideoSyncSGI`.
-  Under a running X compositor (KWin, Mutter, picom etc.) the
-  interval-1 swap blocks for a full vblank while the compositor takes
-  ownership of the buffer, and the SGI wait then consumes a second
-  vblank — net throughput 30 Hz instead of 60 Hz.
-
-  v3.1 detects whether a compositor is running by querying the EWMH
-  `_NET_WM_CM_S<N>` selection at swapchain creation, and also checks
-  whether the window has `_NET_WM_BYPASS_COMPOSITOR=1` set (compositor
-  steps aside; treat as direct).
-
-  With compositor: `interval=0` swap, SGI wait *before* the swap →
-  one vblank gate, 60 Hz, compositor handles its own pipeline.
-
-  Without compositor: `interval=1` swap, SGI wait *after* the swap →
-  driver-side vsync gates the swap, SGI sleep keeps CPU low, 60 Hz.
-
-  The previous `set_bypass_compositor` call has been removed: we now
-  cooperate with the compositor properly so window shadows, blur, and
-  CSD decorations work as expected on desktop deployments. Apps that
-  want direct scanout can still set `_NET_WM_BYPASS_COMPOSITOR=1`
-  themselves; the layer respects that.
-
-## Done in v3.0
+## Done in v3
 
 - **`VK_GOOGLE_display_timing`** is implemented. Apps that use the
   extension to compute frame-drop metrics (Chromium, GeForce NOW

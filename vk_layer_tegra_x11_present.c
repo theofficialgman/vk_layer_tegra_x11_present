@@ -1193,7 +1193,7 @@ static void *worker_thread_main(void *arg) {
 
            The catch: SGI must only be called when the swap itself returned
            quickly.  If the compositor blocked the swap for ~1 vblank (i.e.
-           swap_ns ≥ refresh_duration_ns/2), calling SGI afterwards would
+           swap_ns ≥ refresh_duration_ns/4), calling SGI afterwards would
            add a second vblank wait and cap the frame rate at 30Hz.  When
            the swap was already slow, the vblank is already consumed — skip
            SGI and return immediately to accept the next frame.
