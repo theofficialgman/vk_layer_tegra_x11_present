@@ -566,6 +566,11 @@ typedef struct InstNode {
     InstanceDispatch d;
     bool external_mem_caps;
     bool external_sem_caps;
+    /* True when no NVIDIA physical device was found at CreateInstance time.
+       All surface creation and WSI calls for this instance pass through to
+       the ICD unchanged so the layer is fully transparent for non-NVIDIA
+       instances (llvmpipe, Mesa, etc.). */
+    bool passthrough;
     struct InstNode *next;
 } InstNode;
 static InstNode *g_inst_table[HASH_BUCKETS];
@@ -575,6 +580,13 @@ typedef struct DevNode {
     void *key;
     VkDevice device;
     VkPhysicalDevice phys;
+    /* When true this is a non-NVIDIA device.  d.GetDeviceProcAddr holds
+       next_gdpa so layer_GetDeviceProcAddr can return the next layer's
+       functions, making the layer fully transparent for this device.
+       Only CreateSwapchainKHR and DestroyDevice are still intercepted to
+       handle cleanup of state created by layer_CreateXlibSurfaceKHR /
+       layer_CreateXcbSurfaceKHR (the icd_surface in our Surface*). */
+    bool passthrough;
     VkInstance inst;
     DeviceDispatch d;
     InstanceDispatch *idisp;     /* points into the InstNode for this device */
@@ -720,6 +732,12 @@ typedef struct Surface {
     Display *dpy;            /* Xlib handle. For XCB-only apps, we open one ourselves. */
     bool owns_dpy;
     Window window;
+    /* Real ICD-owned VkSurfaceKHR created alongside our wrapper.  Used
+       when a non-NVIDIA device needs a valid ICD surface handle — the ICD
+       does not know about our Surface* pointer.  Destroyed in
+       DestroySurfaceKHR together with our wrapper. */
+    VkSurfaceKHR icd_surface;
+    VkInstance   icd_inst;
     /* The GLX context lives in the SwapchainData, not here, because it
        must match the GLXFBConfig of the rendering format and the app
        chooses format at swapchain creation time. */
@@ -1727,9 +1745,10 @@ layer_CreateXlibSurfaceKHR(VkInstance instance,
                             const VkXlibSurfaceCreateInfoKHR *pCreateInfo,
                             const VkAllocationCallbacks *pAllocator,
                             VkSurfaceKHR *pSurface) {
-    if (g_layer_disabled) {
+    {
         InstNode *in = inst_lookup(dispatch_key(instance));
-        return in->d.CreateXlibSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+        if (g_layer_disabled || (in && in->passthrough))
+            return in->d.CreateXlibSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
     }
     /* Surface query functions (GetPhysicalDeviceSurfaceCapabilitiesKHR etc.)
        call XGetGeometry and other X11 functions via g_libs.* pointers that
@@ -1746,6 +1765,16 @@ layer_CreateXlibSurfaceKHR(VkInstance instance,
     s->dpy = pCreateInfo->dpy;
     s->window = pCreateInfo->window;
     s->owns_dpy = false;
+    /* Create a real ICD VkSurfaceKHR for this window alongside our wrapper.
+       Non-NVIDIA devices (e.g. llvmpipe) don't know about our Surface*
+       pointer; CreateSwapchainKHR uses this handle when forwarding to them. */
+    {
+        InstNode *in = inst_lookup(dispatch_key(instance));
+        if (in && in->d.CreateXlibSurfaceKHR &&
+            in->d.CreateXlibSurfaceKHR(instance, pCreateInfo, NULL,
+                                        &s->icd_surface) == VK_SUCCESS)
+            s->icd_inst = instance;
+    }
     *pSurface = (VkSurfaceKHR)(uintptr_t)s;
     LOG_INFO("CreateXlibSurfaceKHR -> surface=%p dpy=%p win=0x%lx", s, s->dpy, s->window);
     return VK_SUCCESS;
@@ -1756,9 +1785,10 @@ layer_CreateXcbSurfaceKHR(VkInstance instance,
                            const VkXcbSurfaceCreateInfoKHR *pCreateInfo,
                            const VkAllocationCallbacks *pAllocator,
                            VkSurfaceKHR *pSurface) {
-    if (g_layer_disabled) {
+    {
         InstNode *in = inst_lookup(dispatch_key(instance));
-        return in->d.CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+        if (g_layer_disabled || (in && in->passthrough))
+            return in->d.CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
     }
     /* XCB-only apps don't give us an Xlib Display*. We need one for GLX
        (GLX is Xlib-bound). Open our own Display* over the same X server.
@@ -1776,6 +1806,15 @@ layer_CreateXcbSurfaceKHR(VkInstance instance,
     if (!s->dpy) { free(s); return VK_ERROR_INITIALIZATION_FAILED; }
     s->owns_dpy = true;
     s->window = pCreateInfo->window;
+    /* Create a real ICD VkSurfaceKHR alongside our wrapper for non-NVIDIA
+       device passthrough (see comment in CreateXlibSurfaceKHR). */
+    {
+        InstNode *in = inst_lookup(dispatch_key(instance));
+        if (in && in->d.CreateXcbSurfaceKHR &&
+            in->d.CreateXcbSurfaceKHR(instance, pCreateInfo, NULL,
+                                       &s->icd_surface) == VK_SUCCESS)
+            s->icd_inst = instance;
+    }
     *pSurface = (VkSurfaceKHR)(uintptr_t)s;
     LOG_INFO("CreateXcbSurfaceKHR -> surface=%p dpy=%p (opened) win=0x%x",
              s, s->dpy, pCreateInfo->window);
@@ -1792,6 +1831,8 @@ layer_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
         in->d.DestroySurfaceKHR(instance, surface, pAllocator);
         return;
     }
+    if (s->icd_surface && in)
+        in->d.DestroySurfaceKHR(s->icd_inst, s->icd_surface, NULL);
     if (s->owns_dpy && s->dpy) XCloseDisplay(s->dpy);
     free(s);
 }
@@ -1973,6 +2014,21 @@ layer_CreateSwapchainKHR(VkDevice device,
     if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
 
     Surface *surf = as_surface(ci->surface);
+
+    /* Non-NVIDIA passthrough device: forward to the ICD using the real ICD
+       surface handle stored in our Surface* wrapper.  The ICD does not know
+       about our Surface* pointer and would fault or return an error if given
+       it directly. */
+    if (dev->passthrough) {
+        VkSwapchainCreateInfoKHR modci = *ci;
+        if (surf && surf->icd_surface)
+            modci.surface = surf->icd_surface;
+        PFN_vkCreateSwapchainKHR icd_fn = (PFN_vkCreateSwapchainKHR)
+            dev->d.GetDeviceProcAddr(device, "vkCreateSwapchainKHR");
+        if (!icd_fn) return VK_ERROR_INITIALIZATION_FAILED;
+        return icd_fn(device, &modci, pAlloc, pOut);
+    }
+
     if (g_layer_disabled || !surf)
         return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
 
@@ -2860,6 +2916,33 @@ layer_CreateInstance(const VkInstanceCreateInfo *ci,
     I(GetPhysicalDeviceImageFormatProperties2);
     I(GetPhysicalDeviceExternalSemaphoreProperties);
 #undef I
+    /* Determine whether this instance has any NVIDIA physical device.
+       We check now — before any surfaces are created — so that surface
+       creation functions can immediately pass through for non-NVIDIA
+       instances.  If EnumeratePhysicalDevices fails or returns zero
+       devices we leave passthrough=false (default active) as a safe
+       fallback; the missing-entrypoints guard in CreateDevice will catch
+       any incompatibility later. */
+    if (node->d.EnumeratePhysicalDevices && node->d.GetPhysicalDeviceProperties) {
+        uint32_t nphys = 0;
+        node->d.EnumeratePhysicalDevices(*pInst, &nphys, NULL);
+        VkPhysicalDevice *physdevs = nphys ? calloc(nphys, sizeof(*physdevs)) : NULL;
+        if (physdevs) {
+            node->d.EnumeratePhysicalDevices(*pInst, &nphys, physdevs);
+            bool has_nvidia = false;
+            for (uint32_t i = 0; i < nphys && !has_nvidia; i++) {
+                VkPhysicalDeviceProperties props = {0};
+                node->d.GetPhysicalDeviceProperties(physdevs[i], &props);
+                if (props.vendorID == 0x10DE) has_nvidia = true;
+            }
+            free(physdevs);
+            if (!has_nvidia) {
+                node->passthrough = true;
+                LOG_INFO("CreateInstance: no NVIDIA device found — layer transparent for inst=%p", *pInst);
+            }
+        }
+    }
+
     inst_insert(node);
 
     layer_check_disabled();
@@ -2887,6 +2970,51 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     PFN_vkGetInstanceProcAddr next_gipa = lci->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     PFN_vkGetDeviceProcAddr   next_gdpa = lci->u.pLayerInfo->pfnNextGetDeviceProcAddr;
     lci->u.pLayerInfo = lci->u.pLayerInfo->pNext;
+
+    /* Vendor check: this layer is designed exclusively for NVIDIA Tegra
+       (vendorID 0x10DE).  For any other driver — llvmpipe, Mesa radv,
+       etc. — pass through entirely without modifying the extension list
+       or tracking the device.  This prevents the layer from injecting
+       extensions the driver doesn't support and from crashing on missing
+       entrypoints. */
+    {
+        InstNode *inst_hint = NULL;
+        pthread_mutex_lock(&g_inst_lock);
+        for (int b = 0; b < HASH_BUCKETS && !inst_hint; b++)
+            for (InstNode *n = g_inst_table[b]; n; n = n->next) { inst_hint = n; break; }
+        pthread_mutex_unlock(&g_inst_lock);
+
+        if (inst_hint && inst_hint->d.GetPhysicalDeviceProperties) {
+            VkPhysicalDeviceProperties props = {0};
+            inst_hint->d.GetPhysicalDeviceProperties(phys, &props);
+            if (props.vendorID != 0x10DE) {
+                LOG_INFO("CreateDevice: non-NVIDIA device (vendor=0x%04x, '%s') — layer transparent for this device",
+                         props.vendorID, props.deviceName);
+                /* Call through with the original (unmodified) extension list.
+                   Then create a minimal passthrough DevNode that stores
+                   next_gdpa.  This is essential: our GDPA always runs first
+                   in the chain, and without a DevNode it would return NULL
+                   for non-intercepted functions (e.g. vkGetDeviceQueue),
+                   leaving the app with NULL function pointers. */
+                PFN_vkCreateDevice next_cd =
+                    (PFN_vkCreateDevice)next_gipa(VK_NULL_HANDLE, "vkCreateDevice");
+                if (!next_cd) return VK_ERROR_INITIALIZATION_FAILED;
+                VkResult r = next_cd(phys, ci, pAlloc, pDev);
+                if (r != VK_SUCCESS) return r;
+
+                DevNode *pt = calloc(1, sizeof(*pt));
+                if (!pt) return VK_ERROR_OUT_OF_HOST_MEMORY;
+                pt->device      = *pDev;
+                pt->key         = dispatch_key(*pDev);
+                pt->passthrough = true;
+                /* Store next_gdpa in d.GetDeviceProcAddr; GDPA uses it to
+                   forward all lookups to the next layer for this device. */
+                pt->d.GetDeviceProcAddr = next_gdpa;
+                dev_insert(pt);
+                return VK_SUCCESS;
+            }
+        }
+    }
 
     /* The application's vkCreateDevice doesn't enable the extensions we
        depend on (VK_KHR_external_memory_fd, VK_KHR_external_semaphore_fd,
@@ -3024,9 +3152,9 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
 
     /* Find the first graphics-capable queue family and cache it. */
     uint32_t nqf = 0;
-    in->d.GetPhysicalDeviceQueueFamilyProperties(phys, &nqf, NULL);
-    VkQueueFamilyProperties *qfs = calloc(nqf, sizeof(*qfs));
-    in->d.GetPhysicalDeviceQueueFamilyProperties(phys, &nqf, qfs);
+    if (in) in->d.GetPhysicalDeviceQueueFamilyProperties(phys, &nqf, NULL);
+    VkQueueFamilyProperties *qfs = nqf ? calloc(nqf, sizeof(*qfs)) : NULL;
+    if (in && qfs) in->d.GetPhysicalDeviceQueueFamilyProperties(phys, &nqf, qfs);
     node->graphics_qfi = 0;
     for (uint32_t i = 0; i < nqf; i++)
         if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { node->graphics_qfi = i; break; }
@@ -3043,6 +3171,15 @@ VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
 layer_DestroyDevice(VkDevice dev, const VkAllocationCallbacks *pAlloc) {
     DevNode *node = dev_lookup(dispatch_key(dev));
     if (!node) return;
+    if (node->passthrough) {
+        /* Passthrough device: look up the real DestroyDevice via the stored
+           next_gdpa, remove our DevNode, then call through. */
+        PFN_vkDestroyDevice real_destroy =
+            (PFN_vkDestroyDevice)node->d.GetDeviceProcAddr(dev, "vkDestroyDevice");
+        dev_remove(dispatch_key(dev));
+        if (real_destroy) real_destroy(dev, pAlloc);
+        return;
+    }
     node->d.DestroyDevice(dev, pAlloc);
     pthread_mutex_destroy(&node->submit_lock);
     dev_remove(dispatch_key(dev));
@@ -3096,10 +3233,20 @@ static PFN_vkVoidFunction layer_intercept_device(const char *name) {
 
 VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 layer_GetDeviceProcAddr(VkDevice dev, const char *name) {
-    PFN_vkVoidFunction fn = layer_intercept_device(name);
-    if (fn) return fn;
     DevNode *node = dev_lookup(dispatch_key(dev));
     if (!node) return NULL;
+    if (node->passthrough) {
+        /* Non-NVIDIA passthrough device.  Return the next layer's function
+           for everything except the two functions we must still intercept:
+           DestroyDevice (to clean up our DevNode) and CreateSwapchainKHR
+           (to substitute the real ICD surface handle for our Surface*
+           wrapper before forwarding to the ICD). */
+        if (!strcmp(name, "vkDestroyDevice"))     return (PFN_vkVoidFunction)layer_DestroyDevice;
+        if (!strcmp(name, "vkCreateSwapchainKHR")) return (PFN_vkVoidFunction)layer_CreateSwapchainKHR;
+        return node->d.GetDeviceProcAddr(dev, name);
+    }
+    PFN_vkVoidFunction fn = layer_intercept_device(name);
+    if (fn) return fn;
     return node->d.GetDeviceProcAddr(dev, name);
 }
 
