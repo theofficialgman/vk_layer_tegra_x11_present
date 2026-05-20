@@ -544,6 +544,10 @@ typedef struct {
     PFN_vkCmdPipelineBarrier     CmdPipelineBarrier;
     PFN_vkEndCommandBuffer       EndCommandBuffer;
     PFN_vkCreateRenderPass       CreateRenderPass;
+    /* v2 variants — core in Vulkan 1.2, also available as KHR extension.
+       Vulkan 1.2 apps (e.g. Play PS2 emulator) use these instead of v1. */
+    PFN_vkCreateRenderPass2      CreateRenderPass2;
+    PFN_vkCreateRenderPass2      CreateRenderPass2KHR;
 
     /* The real WSI calls (we delegate format/presentmode queries to them
        sometimes, but otherwise we replace these completely). */
@@ -2616,6 +2620,57 @@ layer_CreateRenderPass(VkDevice device,
     return r;
 }
 
+/* vkCreateRenderPass2 / vkCreateRenderPass2KHR intercept.
+   Same PRESENT_SRC_KHR rewrite as v1, applied to the v2 struct.
+   Vulkan 1.2 apps use this entrypoint instead of v1. */
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreateRenderPass2(VkDevice device,
+                         const VkRenderPassCreateInfo2 *pCreateInfo,
+                         const VkAllocationCallbacks *pAllocator,
+                         VkRenderPass *pRenderPass) {
+    DevNode *dev = dev_lookup(dispatch_key(device));
+    if (!dev || !dev->d.CreateRenderPass2) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!pCreateInfo || pCreateInfo->attachmentCount == 0)
+        return dev->d.CreateRenderPass2(device, pCreateInfo, pAllocator, pRenderPass);
+
+    bool any = false;
+    for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+        VkImageLayout il = pCreateInfo->pAttachments[i].initialLayout;
+        VkImageLayout fl = pCreateInfo->pAttachments[i].finalLayout;
+        if (il == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR || il == VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR ||
+            fl == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR || fl == VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR) {
+            any = true; break;
+        }
+    }
+    if (!any) return dev->d.CreateRenderPass2(device, pCreateInfo, pAllocator, pRenderPass);
+
+    VkAttachmentDescription2 *fixed = malloc(pCreateInfo->attachmentCount * sizeof(*fixed));
+    if (!fixed) return dev->d.CreateRenderPass2(device, pCreateInfo, pAllocator, pRenderPass);
+    memcpy(fixed, pCreateInfo->pAttachments,
+           pCreateInfo->attachmentCount * sizeof(*fixed));
+    for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+        fixed[i].initialLayout = fix_layout(fixed[i].initialLayout);
+        fixed[i].finalLayout   = fix_layout(fixed[i].finalLayout);
+    }
+    VkRenderPassCreateInfo2 mod = *pCreateInfo;
+    mod.pAttachments = fixed;
+    VkResult r = dev->d.CreateRenderPass2(device, &mod, pAllocator, pRenderPass);
+    free(fixed);
+    return r;
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreateRenderPass2KHR(VkDevice device,
+                             const VkRenderPassCreateInfo2 *pCreateInfo,
+                             const VkAllocationCallbacks *pAllocator,
+                             VkRenderPass *pRenderPass) {
+    /* KHR alias — same struct, same rewrite logic.  Both d.CreateRenderPass2
+       and d.CreateRenderPass2KHR are set to whichever entrypoints the driver
+       exposes (with fallback to each other), so layer_CreateRenderPass2 calls
+       through correctly regardless of which name the driver uses. */
+    return layer_CreateRenderPass2(device, pCreateInfo, pAllocator, pRenderPass);
+}
+
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 layer_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence) {
     DevNode *dev = dev_lookup(dispatch_key(queue));
@@ -3128,6 +3183,14 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     D(CmdPipelineBarrier);
     D(EndCommandBuffer);
     D(CreateRenderPass);
+    /* Vulkan 1.2 render pass v2: core name first, KHR alias as fallback
+       for drivers that only expose the extension entrypoint. */
+    D(CreateRenderPass2);
+    if (!node->d.CreateRenderPass2)
+        node->d.CreateRenderPass2 = (PFN_vkCreateRenderPass2)next_gdpa(*pDev, "vkCreateRenderPass2KHR");
+    D(CreateRenderPass2KHR);
+    if (!node->d.CreateRenderPass2KHR)
+        node->d.CreateRenderPass2KHR = node->d.CreateRenderPass2;
     D(CreateSwapchainKHR);
     D(DestroySwapchainKHR);
     D(GetSwapchainImagesKHR);
@@ -3227,6 +3290,8 @@ static PFN_vkVoidFunction layer_intercept_device(const char *name) {
     MATCH(CmdPipelineBarrier);
     MATCH(EndCommandBuffer);
     MATCH(CreateRenderPass);
+    MATCH(CreateRenderPass2);
+    MATCH(CreateRenderPass2KHR);
 #undef MATCH
     return NULL;
 }
