@@ -1680,8 +1680,13 @@ static bool gl_import_image(Swapchain *sc, PerImage *pi) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
     }
+    /* D3D games (via DXVK) often leave the backbuffer alpha channel at 0
+       (D3D's X8 formats have undefined alpha). If GL samples that alpha=0 and
+       the child window has a 32-bit RGBA visual, the compositor blends the
+       window as fully transparent — showing the blank parent window behind it.
+       Force alpha=1 so the child window is always opaque to the compositor. */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
     return true;
 }
 
