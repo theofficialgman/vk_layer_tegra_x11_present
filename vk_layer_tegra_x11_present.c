@@ -916,6 +916,27 @@ typedef struct Swapchain {
     pthread_cond_t   worker_cv_done;      /* app waits on this when posting to full slot */
     bool             worker_pending;      /* slot has work? */
     uint32_t         worker_pending_idx;  /* image index in pending slot */
+    /* True from the moment worker_post() fills the pending slot until the
+       worker's OWN per-frame submit (wait vk_render_done / signal
+       gl_sample_done) for worker_pending_idx has completed. worker_pending
+       itself stays true for the WHOLE frame (through the GL sample,
+       glXSwapBuffers, and the vsync wait, well after the semaphores are
+       drained) -- MAILBOX displacement must not key off worker_pending
+       directly, or a worker_post() that lands after the worker has already
+       consumed worker_pending_idx's semaphores (but hasn't finished the
+       rest of the frame yet) "displaces" an image whose vk_render_done/
+       gl_sample_done were already fully waited/signalled by the worker
+       itself, and the resulting drop-cleanup double-signals gl_sample_done
+       -- undefined behaviour, observed hanging the GPU (nvgpu
+       channel-timeout watchdog). Ported from prototypes/flip4_present/
+       flip_layer.c, where this was found 2026-08-17 via
+       FLIP_TEST_TRACE_SYNC on the Play emulator -- an earlier fix
+       (clearing at submit-issue time instead of dequeue time) only pushed
+       the failure point later (frame ~8 to ~12) because that was only half
+       the race; see AcquireNextImageKHR's own-pending-slot check and
+       QueuePresentKHR's lock-scope comment for the other two parts of the
+       same fix. */
+    bool             worker_pending_sem_live;
     /* VK_GOOGLE_display_timing: presentID and desiredPresentTime supplied
        by the app for the pending work (zero if not set). The worker
        captures actualPresentTime when the SGI vblank wait returns and
@@ -946,11 +967,35 @@ typedef struct Swapchain {
 } Swapchain;
 
 #define SWAPCHAIN_MAGIC 0x5357415043484149ULL    /* "SWAPCHAI" — 8 bytes, fits uint64_t */
+/* Set on a Swapchain* by layer_DestroySwapchainKHR instead of freeing the
+ * struct -- see the comment there for why. Distinct from SWAPCHAIN_MAGIC so
+ * as_swapchain() (which only recognizes live swapchains) correctly treats
+ * a destroyed one as "not ours" for normal use, while is_dead_swapchain()
+ * can still specifically identify it as a handle that WAS ours. Ported
+ * from prototypes/flip4_present/flip_layer.c -- see is_dead_swapchain's
+ * comment there (2026-08-18, Flatpak DDNet crash) for the full story: an
+ * app calling Acquire/Present/GetSwapchainImages on a handle it (or
+ * another of its own threads) already destroyed must get a real Vulkan
+ * error, never a blind forward of a handle that was never a valid native
+ * one to begin with -- forwarding it crashes the ICD on a foreign,
+ * unallocated pointer. */
+#define SWAPCHAIN_MAGIC_DEAD 0x4445414444454144ULL /* "DEADDEAD" — 8 bytes, fits uint64_t */
 
 static Swapchain *as_swapchain(VkSwapchainKHR s) {
     Swapchain *p = (Swapchain *)(uintptr_t)s;
     if (!p || p->magic != SWAPCHAIN_MAGIC) return NULL;
     return p;
+}
+
+/* True if this handle used to be one of our own Swapchain* structs and has
+ * since been destroyed via layer_DestroySwapchainKHR. Entry points that
+ * fall through to the real ICD for handles as_swapchain() doesn't
+ * recognize (Acquire/Present/GetSwapchainImages) must check this FIRST and
+ * refuse to forward -- a destroyed swapchain's handle is not a valid
+ * native ICD handle, and the ICD segfaults on it. */
+static bool is_dead_swapchain(VkSwapchainKHR s) {
+    Swapchain *p = (Swapchain *)(uintptr_t)s;
+    return p && p->magic == SWAPCHAIN_MAGIC_DEAD;
 }
 
 static void track_swapchain(Swapchain *sc);
@@ -1155,6 +1200,28 @@ static void *worker_thread_main(void *arg) {
         uint32_t idx = sc->worker_pending_idx;
         uint32_t present_id = sc->worker_pending_present_id;
         uint64_t desired_ns = sc->worker_pending_desired_ns;
+        /* Claim this slot the instant it's dequeued, not later at the
+           worker's own submit call: dequeuing already commits this idx to
+           being processed (its vk_render_done WILL be waited on and
+           gl_sample_done WILL be signaled by this iteration,
+           unconditionally, once it reaches the submit below) -- there is
+           real CPU work between dequeue and that submit (the
+           XGetGeometry/resize check just below). If a new worker_post()
+           lands during that window and still sees worker_pending_sem_live
+           true for this same idx (stale, not yet cleared), it displaces it
+           and queues its OWN wait on vk_render_done -- racing the worker's
+           own soon-to-be-issued wait on the identical, only-signaled-once
+           semaphore. Whichever submit is issued second can never be
+           satisfied and hangs the GPU (nvgpu channel-timeout watchdog).
+           Clearing here, still under worker_lock from the dequeue above
+           (no intervening unlock -- an unlock-then-relock would reopen the
+           exact window this is closing), means by the time any later
+           worker_post() can run, this slot is already correctly "not
+           displaceable". Ported from prototypes/flip4_present/
+           flip_layer.c, found 2026-08-17 via FLIP_TEST_TRACE_SYNC, Play
+           emulator -- an earlier fix (clearing at submit-issue time) only
+           handled the mirror-image ordering and left this one open. */
+        sc->worker_pending_sem_live = false;
         pthread_mutex_unlock(&sc->worker_lock);
 
         /* Refresh window size if changed. Cheap when unchanged. Use the
@@ -1390,10 +1457,15 @@ static void worker_post(Swapchain *sc, uint32_t idx,
         /* FIFO path: block until slot is free. */
         while (sc->worker_pending && sc->worker_running)
             pthread_cond_wait(&sc->worker_cv_done, &sc->worker_lock);
-    } else if (sc->worker_pending) {
-        /* MAILBOX path: a previous present hasn't been picked up yet.
-           Replace it; the caller will handle the displaced image's
-           semaphore cleanup. */
+    } else if (sc->worker_pending_sem_live) {
+        /* MAILBOX path: a previous present hasn't had its semaphores
+           consumed by the worker yet. Replace it; the caller will handle
+           the displaced image's semaphore cleanup. If worker_pending is
+           true but worker_pending_sem_live is false, the worker already
+           waited vk_render_done / signalled gl_sample_done for that slot
+           itself (it's just still mid-GL-sample/swap for the rest of the
+           frame) -- treating that as displaceable here would double-signal
+           gl_sample_done. See worker_pending_sem_live's declaration. */
         displaced = sc->worker_pending_idx;
     }
 
@@ -1404,6 +1476,7 @@ static void worker_post(Swapchain *sc, uint32_t idx,
     }
     sc->worker_pending = true;
     sc->worker_pending_idx = idx;
+    sc->worker_pending_sem_live = true;
     sc->worker_pending_present_id = present_id;
     sc->worker_pending_desired_ns = desired_ns;
     pthread_cond_signal(&sc->worker_cv_pending);
@@ -2233,7 +2306,20 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
     if (!swapchain) return;
     Swapchain *sc = as_swapchain(swapchain);
     DevNode *dev = dev_lookup(dispatch_key(device));
-    if (!sc) { if (dev) dev->d.DestroySwapchainKHR(device, swapchain, pAlloc); return; }
+    if (!sc) {
+        if (is_dead_swapchain(swapchain)) {
+            /* Double-destroy on a handle we already tombstoned -- also
+               undefined behavior per spec (like the stale-Acquire race
+               this tombstoning was added for, see is_dead_swapchain's
+               comment), but never forward it to the ICD: it was never a
+               real native handle in the first place. Log and stop here. */
+            LOG_WARN("DestroySwapchainKHR: swapchain=%p already destroyed, ignoring "
+                     "double-destroy", (void *)swapchain);
+            return;
+        }
+        if (dev) dev->d.DestroySwapchainKHR(device, swapchain, pAlloc);
+        return;
+    }
 
     /* Drain any in-flight work. */
     dev->d.DeviceWaitIdle(dev->device);
@@ -2264,8 +2350,23 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
     pthread_cond_destroy(&sc->worker_cv_done);
     pthread_mutex_destroy(&sc->worker_lock);
     pthread_mutex_destroy(&sc->timing_lock);
+    /* Zero everything (defensive -- nothing should read any other field
+       from a dead handle, but stale pointers are one less thing to worry
+       about if something ever does), then tombstone rather than free().
+       Deliberately never freed: as_swapchain()/is_dead_swapchain() rely on
+       this exact address still being readable and still holding a magic
+       value for the entire remaining lifetime of the process, so that any
+       later call on this handle -- however it got here, whatever bug in
+       the app produced it -- is recognized as "used to be ours" and
+       rejected with a proper Vulkan error instead of being forwarded to
+       the real ICD as a foreign, unallocated handle it crashes on. See
+       is_dead_swapchain's comment for the full story. Costs one small,
+       permanent allocation per swapchain ever created by an app using
+       this layer -- swapchains are created rarely enough (window resizes,
+       fullscreen toggles) that this is a reasonable trade for turning a
+       hard crash into a graceful error. */
     memset(sc, 0, sizeof(*sc));
-    free(sc);
+    sc->magic = SWAPCHAIN_MAGIC_DEAD;
 }
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
@@ -2273,6 +2374,12 @@ layer_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
                              uint32_t *pCount, VkImage *pImages) {
     Swapchain *sc = as_swapchain(swapchain);
     if (!sc) {
+        if (is_dead_swapchain(swapchain)) {
+            /* See is_dead_swapchain's comment: never forward a handle
+               that used to be ours to the real ICD, it's never a valid
+               native handle. */
+            return VK_ERROR_OUT_OF_DATE_KHR;
+        }
         DevNode *dev = dev_lookup(dispatch_key(device));
         return dev->d.GetSwapchainImagesKHR(device, swapchain, pCount, pImages);
     }
@@ -2348,19 +2455,65 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
                            uint64_t timeout, VkSemaphore semaphore, VkFence fence,
                            uint32_t *pIndex) {
+    /* as_swapchain() -- one O(1) pointer dereference -- MUST run before
+       is_dead_swapchain() here, not after: Acquire is called every single
+       frame for a normal, currently-alive swapchain, which is the
+       overwhelming majority of all calls into this function. Checking
+       only on the alive-swapchain miss path below means every ordinary
+       frame pays only the cheap check. */
     Swapchain *sc = as_swapchain(swapchain);
     DevNode *dev = dev_lookup(dispatch_key(device));
-    if (!sc) return dev->d.AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pIndex);
+    if (!sc) {
+        if (is_dead_swapchain(swapchain)) {
+            /* This is the crash this whole tombstoning scheme exists to
+               prevent -- an app calling Acquire on a swapchain it (or
+               another of its own threads) already destroyed must get a
+               real Vulkan error here, never a blind forward of a handle
+               that was never a valid native one to begin with.
+               VK_ERROR_OUT_OF_DATE_KHR is the spec-correct "this swapchain
+               is no longer usable, recreate it" signal -- apps generally
+               already handle it, which may even let this self-recover
+               instead of crashing. */
+            return VK_ERROR_OUT_OF_DATE_KHR;
+        }
+        return dev->d.AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pIndex);
+    }
 
     pthread_mutex_lock(&sc->lock);
-    /* Find the next free image. Round-robin among acquired==false images. */
+    /* Find the next free image. Round-robin among acquired==false images
+       that also aren't the worker's current pending slot
+       (worker_pending_idx).
+
+       The pending-slot check matters only under MAILBOX: QueuePresentKHR
+       clears acquired=false immediately (before the worker has actually
+       consumed the image), so without it a fast MAILBOX app can re-acquire
+       and re-present the SAME image while its earlier post is still
+       sitting unconsumed in worker_pending_idx. worker_post's mailbox path
+       then "displaces" that same idx against itself: the image's
+       vk_render_done binary semaphore gets signaled a second time (by the
+       new post's own bridge submit) before the first signal is ever
+       waited on, which is undefined behaviour and was observed to hang
+       the GPU (nvgpu channel-timeout watchdog) on real hardware. Ported
+       from prototypes/flip4_present/flip_layer.c -- confirmed
+       MAILBOX-specific: forcing FIFO (which blocks in worker_post until
+       the slot is actually drained, so this window can't open) made the
+       hang disappear entirely. Under FIFO this check is always false
+       since a slot is never both free and still pending. */
     uint32_t idx = sc->next_acquire;
     uint32_t tried = 0;
-    while (tried < sc->image_count && sc->images[idx].acquired) {
+    bool busy = true;
+    while (tried < sc->image_count) {
+        busy = sc->images[idx].acquired;
+        if (!busy) {
+            pthread_mutex_lock(&sc->worker_lock);
+            if (sc->worker_pending && sc->worker_pending_idx == idx) busy = true;
+            pthread_mutex_unlock(&sc->worker_lock);
+        }
+        if (!busy) break;
         idx = (idx + 1) % sc->image_count;
         tried++;
     }
-    if (tried == sc->image_count) {
+    if (busy) {
         pthread_mutex_unlock(&sc->lock);
         return VK_NOT_READY;
     }
@@ -2775,8 +2928,19 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
     VkResult overall = VK_SUCCESS;
 
     for (uint32_t s = 0; s < pInfo->swapchainCount; s++) {
+        /* as_swapchain() first, is_dead_swapchain() only on the miss path
+           -- see the ordering comment in layer_AcquireNextImageKHR (same
+           per-frame hot-path reasoning applies here). */
         Swapchain *sc = as_swapchain(pInfo->pSwapchains[s]);
         if (!sc) {
+            if (is_dead_swapchain(pInfo->pSwapchains[s])) {
+                /* See is_dead_swapchain's comment: never forward a handle
+                   that used to be ours to the real ICD. */
+                VkResult r = VK_ERROR_OUT_OF_DATE_KHR;
+                if (pInfo->pResults) pInfo->pResults[s] = r;
+                if (overall == VK_SUCCESS) overall = r;
+                continue;
+            }
             /* Mixed batch — submit just this one through real WSI. */
             VkPresentInfoKHR sub = *pInfo;
             sub.swapchainCount = 1;
@@ -2832,9 +2996,24 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
            the previous image — that's the natural backpressure point.
            In MAILBOX mode this call returns immediately and reports back
            the index of any image whose place we just took, so we can
-           clean up its dangling semaphores before the next iteration. */
+           clean up its dangling semaphores before the next iteration.
+
+           sc->lock stays held through worker_post AND the displaced-image
+           drop-cleanup submit below (not released right after
+           acquired=false, as before) so a concurrent AcquireNextImageKHR
+           can never observe a displaced image in the gap between
+           worker_post() returning it and its drop-cleanup submit actually
+           signalling gl_sample_done -- that gap let a fast MAILBOX app
+           (multi-threaded acquire/present) re-acquire and re-present the
+           displaced image before its earlier vk_render_done signal had a
+           matching wait queued yet, double-signalling that binary
+           semaphore and hanging the GPU (nvgpu channel-timeout watchdog).
+           Ported from prototypes/flip4_present/flip_layer.c, found
+           2026-08-17, Play emulator: fixing only AcquireNextImageKHR's
+           own-pending-slot race (see its round-robin comment) pushed the
+           hang from frame ~8 to ~12 instead of eliminating it -- this was
+           the second half of the same race. */
         sc->images[idx].acquired = false;
-        pthread_mutex_unlock(&sc->lock);
 
         uint32_t present_id = 0;
         uint64_t desired_ns = 0;
@@ -2884,6 +3063,7 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
                    wanted. Best effort. */
             }
         }
+        pthread_mutex_unlock(&sc->lock);
 
         if (pInfo->pResults) pInfo->pResults[s] = VK_SUCCESS;
     }
